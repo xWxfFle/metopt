@@ -10,17 +10,11 @@ import matplotlib.pyplot as plt
 import numpy as np
 from matplotlib.backends.backend_pdf import PdfPages
 
-
-# Создание функции из строки (из result.py)
 _allowed_math_names = {k: getattr(math, k) for k in dir(math) if not k.startswith('\n')}
 _allowed_math_names.update({'pi': math.pi, 'e': math.e, 'inf': math.inf})
 
 
 def make_function_from_string(expr: str) -> Callable[[float], float]:
-    """Создаёт функцию f(x) из строки expr безопасным способом.
-    Поддерживаются имена из модуля math и переменная x.
-    Пример: 'x + math.sin(3.14159*x)' или 'x + sin(3.14159*x)'.
-    """
     local_dict = dict(_allowed_math_names)  # copy
     code = compile(expr, '<string>', 'eval')
     def f(x):
@@ -36,8 +30,7 @@ def make_vectorized_function(f: Callable[[float], float]) -> Callable[[np.ndarra
     return f_vectorized
 
 
-# Алгоритм Piyavskii-Shubert (из result.py)
-def piyavskii_shubert(
+def piyavskii(
     f: Callable[[float], float],
     a: float,
     b: float,
@@ -47,7 +40,6 @@ def piyavskii_shubert(
     initial_points: int = 5,
     verbose: bool = False
 ) -> dict:
-    """Реализация метода Piyavskii-Shubert для глобальной оптимизации липшицевой функции."""
     t0 = time.perf_counter()
     xs = list(np.linspace(a, b, initial_points))
     fs = [f(x) for x in xs]
@@ -311,7 +303,7 @@ def run_custom(args: argparse.Namespace) -> None:
     f_scalar = make_function_from_string(args.function)
     f_vector = make_vectorized_function(f_scalar)
     
-    result = piyavskii_shubert(
+    result = piyavskii(
         f_scalar,
         args.left,
         args.right,
@@ -329,7 +321,7 @@ def run_custom(args: argparse.Namespace) -> None:
         (args.left, args.right),
         args.function,
         Path(args.output),
-        title="Глобальный поиск минимума (Piyavskii-Shubert)",
+        title="Глобальный поиск минимума Метод Пиявского",
     )
     
     # Вывод результатов в консоль
@@ -350,7 +342,7 @@ def run_demo(args: argparse.Namespace) -> None:
     f_scalar = make_function_from_string(expression)
     f_vector = make_vectorized_function(f_scalar)
     
-    result = piyavskii_shubert(
+    result = piyavskii(
         f_scalar,
         left,
         right,
@@ -368,7 +360,7 @@ def run_demo(args: argparse.Namespace) -> None:
         (left, right),
         expression,
         Path(args.output),
-        title="Демонстрация: функция Растригина (1D)",
+        title="Демонстрация: Метод Пиявского",
     )
     
     print("\nРезультаты оптимизации (демонстрация):")
