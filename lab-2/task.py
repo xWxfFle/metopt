@@ -3,167 +3,221 @@ from __future__ import annotations
 import argparse
 import math
 import time
-from dataclasses import dataclass
 from pathlib import Path
 from typing import Callable, List, Sequence, Tuple
 
 import matplotlib.pyplot as plt
 import numpy as np
 from matplotlib.backends.backend_pdf import PdfPages
-from sympy import Symbol, sympify
-from sympy.utilities.lambdify import lambdify
 
 
-@dataclass
-class OptimizationResult:
-    x_min: float
-    f_min: float
-    iterations: int
-    elapsed: float
-    samples: List[Tuple[float, float]]
+# Создание функции из строки (из result.py)
+_allowed_math_names = {k: getattr(math, k) for k in dir(math) if not k.startswith('\n')}
+_allowed_math_names.update({'pi': math.pi, 'e': math.e, 'inf': math.inf})
 
 
-def build_function(
-    expression: str,
-) -> Tuple[Callable[[float], float], Callable[[np.ndarray], np.ndarray]]:
-    x = Symbol("x")
-    expr = sympify(expression, locals={"pi": math.pi})
-    f_numpy = lambdify(x, expr, modules=["numpy"])
+def make_function_from_string(expr: str) -> Callable[[float], float]:
+    """Создаёт функцию f(x) из строки expr безопасным способом.
+    Поддерживаются имена из модуля math и переменная x.
+    Пример: 'x + math.sin(3.14159*x)' или 'x + sin(3.14159*x)'.
+    """
+    local_dict = dict(_allowed_math_names)  # copy
+    code = compile(expr, '<string>', 'eval')
+    def f(x):
+        local_dict['x'] = float(x)
+        return float(eval(code, {'__builtins__': {}}, local_dict))
+    return f
 
-    def f_scalar(value: float) -> float:
-        return float(f_numpy(value))
 
-    return f_scalar, f_numpy
+def make_vectorized_function(f: Callable[[float], float]) -> Callable[[np.ndarray], np.ndarray]:
+    """Создаёт векторизованную версию функции для работы с numpy массивами."""
+    def f_vectorized(x_arr: np.ndarray) -> np.ndarray:
+        return np.array([f(x) for x in x_arr])
+    return f_vectorized
 
 
-def strongin_global_search(
-    func: Callable[[float], float],
-    interval: Tuple[float, float],
-    eps: float,
-    r: float = 2.0,
-    max_iter: int = 10_000,
-) -> OptimizationResult:
-    """Реализация однопараметрического метода Строгина."""
+# Алгоритм Piyavskii-Shubert (из result.py)
+def piyavskii_shubert(
+    f: Callable[[float], float],
+    a: float,
+    b: float,
+    eps: float = 1e-2,
+    L: float = None,
+    max_iter: int = 20000,
+    initial_points: int = 5,
+    verbose: bool = False
+) -> dict:
+    """Реализация метода Piyavskii-Shubert для глобальной оптимизации липшицевой функции."""
+    t0 = time.perf_counter()
+    xs = list(np.linspace(a, b, initial_points))
+    fs = [f(x) for x in xs]
+    
+    if L is None:
+        L_est = 0.0
+        for i in range(len(xs)-1):
+            dx = xs[i+1] - xs[i]
+            slope = abs(fs[i+1] - fs[i]) / dx
+            if slope > L_est:
+                L_est = slope
+        L = max(L_est * 1.2, 1e-6)
+        if verbose:
+            print(f'Estimated L = {L:.6g}')
+    else:
+        L = float(L)
 
-    left, right = interval
-    if left >= right:
-        raise ValueError("Левая граница должна быть меньше правой.")
+    def intersection_x(xi, fi, xj, fj):
+        return (fj - fi) / (2*L) + (xj + xi) / 2
 
-    if eps <= 0:
-        raise ValueError("Точность eps должна быть положительной.")
-
-    start_time = time.perf_counter()
-    sampled = [(left, func(left)), (right, func(right))]
     iterations = 0
-
+    history = []
     while iterations < max_iter:
-        sampled.sort(key=lambda p: p[0])
-
-        slopes = []
-        for (x0, y0), (x1, y1) in zip(sampled[:-1], sampled[1:]):
-            delta = x1 - x0
-            if delta <= 0:
-                continue
-            slopes.append(abs(y1 - y0) / delta)
-
-        m = max(slopes) if slopes else 0.0
-        m = r * m if m > 0 else 1.0
-
-        best_idx = None
-        best_r = -math.inf
-
-        for i in range(len(sampled) - 1):
-            xi, yi = sampled[i]
-            xj, yj = sampled[i + 1]
-            delta = xj - xi
-            if delta <= 0:
-                continue
-
-            r_i = m * delta + (yj - yi) ** 2 / (m * delta) - 2.0 * (yj + yi)
-
-            if r_i > best_r:
-                best_r = r_i
-                best_idx = i
-
-        if best_idx is None:
-            break
-
-        xi, yi = sampled[best_idx]
-        xj, yj = sampled[best_idx + 1]
-        delta = xj - xi
-
-        if delta < eps:
-            break
-
-        x_new = 0.5 * (xi + xj) - (yj - yi) / (2.0 * m)
-        x_new = min(max(x_new, left), right)
-        y_new = func(x_new)
-
-        sampled.append((x_new, y_new))
         iterations += 1
+        order = sorted(range(len(xs)), key=lambda i: xs[i])
+        xs = [xs[i] for i in order]
+        fs = [fs[i] for i in order]
+        upper = min(fs)
+        x_upper = xs[fs.index(upper)]
+        
+        best_interval = None
+        best_h = math.inf
+        best_x = None
+        for i in range(len(xs)-1):
+            xi, xj = xs[i], xs[i+1]
+            fi, fj = fs[i], fs[i+1]
+            x_star = intersection_x(xi, fi, xj, fj)
+            if x_star <= xi:
+                x_star = (xi + xj) / 2.0
+            if x_star >= xj:
+                x_star = (xi + xj) / 2.0
+            h_val = fi - L * (x_star - xi)
+            if h_val < best_h:
+                best_h = h_val
+                best_interval = (xi, xj, fi, fj)
+                best_x = x_star
+        
+        lower = best_h
+        
+        if upper - lower <= eps:
+            t_elapsed = time.perf_counter() - t0
+            return {
+                'x_min': x_upper,
+                'f_min': upper,
+                'iterations': iterations,
+                'time': t_elapsed,
+                'xs': xs,
+                'fs': fs,
+                'L': L,
+                'lower_bound': lower,
+                'upper_bound': upper,
+                'history': history
+            }
+        
+        fx_new = f(best_x)
+        xs.append(best_x)
+        fs.append(fx_new)
+        history.append((best_x, fx_new))
+        
+        if iterations % 200 == 0 and iterations > 0:
+            L_est = 0.0
+            for i in range(len(xs)-1):
+                dx = abs(xs[i+1] - xs[i])
+                slope = abs(fs[i+1] - fs[i]) / dx if dx > 0 else 0.0
+                if slope > L_est:
+                    L_est = slope
+            if L_est > L:
+                if verbose:
+                    print(f'Increasing L: {L} -> {L_est*1.05}')
+                L = L_est * 1.05
 
-    sampled.sort(key=lambda p: p[0])
-    x_min, f_min = min(sampled, key=lambda p: p[1])
-    elapsed = time.perf_counter() - start_time
+    t_elapsed = time.perf_counter() - t0
+    best_f = min(fs)
+    best_x = xs[fs.index(best_f)]
+    return {
+        'x_min': best_x,
+        'f_min': best_f,
+        'iterations': iterations,
+        'time': t_elapsed,
+        'xs': xs,
+        'fs': fs,
+        'L': L,
+        'lower_bound': None,
+        'upper_bound': best_f,
+        'history': history
+    }
 
-    return OptimizationResult(
-        x_min=x_min,
-        f_min=f_min,
-        iterations=iterations,
-        elapsed=elapsed,
-        samples=sampled,
-    )
 
+def compute_lower_envelope(xs, fs, L, grid_x):
+    """Вычисляет нижнюю огибающую для визуализации."""
+    hvals = np.full_like(grid_x, np.inf, dtype=float)
+    for xi, fi in zip(xs, fs):
+        hvals = np.minimum(hvals, fi - L * np.abs(grid_x - xi))
+    return hvals
 
 def render_report(
+    func: Callable[[float], float],
     func_vectorized: Callable[[np.ndarray], np.ndarray],
-    result: OptimizationResult,
+    result: dict,
     interval: Tuple[float, float],
     expression: str,
     output_path: Path,
     title: str = "Глобальный поиск минимума",
 ) -> None:
+    """Создаёт визуализацию и сохраняет отчёт в PDF с информацией о замерах."""
     output_path.parent.mkdir(parents=True, exist_ok=True)
 
     x_min, x_max = interval
     xs = np.linspace(x_min, x_max, 1_000)
     ys = func_vectorized(xs)
+    
+    # Вычисляем нижнюю огибающую
+    hvals = compute_lower_envelope(result['xs'], result['fs'], result['L'], xs)
 
-    samples = np.array(result.samples)
-    fig, ax = plt.subplots(figsize=(10, 6), dpi=150)
+    fig, ax = plt.subplots(figsize=(12, 7), dpi=150)
 
+    # График исходной функции
     ax.plot(xs, ys, label="f(x)", color="#1f77b4", linewidth=2)
-    ax.plot(
-        samples[:, 0],
-        samples[:, 1],
-        marker="o",
-        linestyle="-",
-        color="#ff7f0e",
-        label="Ломаная по испытательным точкам",
-    )
+    
+    # Нижняя огибающая
+    ax.plot(xs, hvals, '--', linewidth=1.5, color="#9467bd", label="Нижняя огибающая h(x)")
+    
+    # Испытанные точки
+    xs_arr = np.array(result['xs'])
+    fs_arr = np.array(result['fs'])
+    ax.scatter(xs_arr, fs_arr, c='red', s=30, zorder=4, label='Испытанные точки', alpha=0.7)
+    
+    # Найденный минимум
     ax.scatter(
-        [result.x_min],
-        [result.f_min],
+        [result['x_min']],
+        [result['f_min']],
         color="#2ca02c",
-        s=80,
+        s=120,
         zorder=5,
+        marker='*',
+        edgecolors='black',
+        linewidths=1,
         label="Найденный минимум",
     )
-    ax.set_title(title, fontsize=14)
-    ax.set_xlabel("x")
-    ax.set_ylabel("f(x)")
+    
+    ax.set_title(title, fontsize=14, fontweight='bold')
+    ax.set_xlabel("x", fontsize=12)
+    ax.set_ylabel("f(x)", fontsize=12)
     ax.grid(True, linestyle="--", alpha=0.4)
-    ax.legend(loc="best")
+    ax.legend(loc="best", fontsize=10)
 
     info_lines = [
         f"f(x) = {expression}",
         f"[a, b] = [{x_min:.6g}, {x_max:.6g}]",
-        f"x* ≈ {result.x_min:.6g}",
-        f"f(x*) ≈ {result.f_min:.6g}",
-        f"Количество итераций: {result.iterations}",
-        f"Время работы: {result.elapsed:.3f} с",
-        f"Число испытательных точек: {len(result.samples)}",
+        f"x* ≈ {result['x_min']:.6g}",
+        f"f(x*) ≈ {result['f_min']:.6g}",
+        f"Количество итераций: {result['iterations']}",
+        f"Время работы: {result['time']:.4f} с",
+        f"Число испытательных точек: {len(result['xs'])}",
+        f"Оценка константы Липшица L: {result['L']:.6g}",
     ]
+    if result.get('lower_bound') is not None:
+        info_lines.append(f"Нижняя граница: {result['lower_bound']:.6g}")
+        info_lines.append(f"Верхняя граница: {result['upper_bound']:.6g}")
+    
     info_text = "\n".join(info_lines)
     fig.text(
         0.98,
@@ -179,59 +233,136 @@ def render_report(
     with PdfPages(output_path) as pdf:
         pdf.savefig(fig, bbox_inches="tight")
 
-    fig.savefig(output_path.with_suffix(".png"), bbox_inches="tight")
+    # Также сохраняем PNG
+    fig.savefig(output_path.with_suffix(".png"), bbox_inches="tight", dpi=150)
     plt.close(fig)
 
 
 def parse_arguments(argv: Sequence[str] | None = None) -> argparse.Namespace:
+    """Парсинг аргументов командной строки."""
     parser = argparse.ArgumentParser(
-        description="Поиск глобального экстремума одномерной липшицевой функции.",
+        description="Поиск глобального экстремума одномерной липшицевой функции методом Piyavskii-Shubert.",
+    )
+    parser.add_argument(
+        "--function",
+        type=str,
+        help="Строка с выражением функции f(x). Если не указана, используется демонстрационная функция.",
+    )
+    parser.add_argument(
+        "--left",
+        type=float,
+        help="Левая граница отрезка.",
+    )
+    parser.add_argument(
+        "--right",
+        type=float,
+        help="Правая граница отрезка.",
     )
     parser.add_argument(
         "--eps",
         type=float,
         default=1e-2,
-        help="Точность остановки (по x).",
+        help="Точность остановки (по разнице верхней и нижней границ).",
     )
     parser.add_argument(
-        "--r",
+        "--L",
         type=float,
-        default=2.0,
-        help="Параметр надежности метода Строгина (r > 1).",
+        default=None,
+        help="Константа Липшица (если не указана, оценивается автоматически).",
     )
     parser.add_argument(
         "--max-iter",
         type=int,
-        default=10_000,
+        default=20000,
         help="Максимальное число итераций.",
+    )
+    parser.add_argument(
+        "--initial-points",
+        type=int,
+        default=5,
+        help="Число начальных точек для инициализации.",
     )
     parser.add_argument(
         "--output",
         type=Path,
         default=Path("lab-2") / "optimization_report.pdf",
-        help="Путь к итоговому PDF-отчету (без расширения PNG).",
+        help="Путь к итоговому PDF-отчету (PNG будет создан автоматически).",
     )
     parser.add_argument(
         "--demo",
         action="store_true",
-        help="Запустить демонстрацию на тестовой функции Растригина.",
+        help="Запустить демонстрацию на функции Растригина.",
+    )
+    parser.add_argument(
+        "--verbose",
+        action="store_true",
+        help="Выводить дополнительную информацию во время работы.",
     )
     return parser.parse_args(argv)
 
 
+def run_custom(args: argparse.Namespace) -> None:
+    """Запуск с пользовательскими параметрами."""
+    if args.function is None or args.left is None or args.right is None:
+        raise ValueError(
+            "Для пользовательского запуска требуется задать --function, --left и --right.",
+        )
+
+    f_scalar = make_function_from_string(args.function)
+    f_vector = make_vectorized_function(f_scalar)
+    
+    result = piyavskii_shubert(
+        f_scalar,
+        args.left,
+        args.right,
+        eps=args.eps,
+        L=args.L,
+        max_iter=args.max_iter,
+        initial_points=args.initial_points,
+        verbose=args.verbose,
+    )
+    
+    render_report(
+        f_scalar,
+        f_vector,
+        result,
+        (args.left, args.right),
+        args.function,
+        Path(args.output),
+        title="Глобальный поиск минимума (Piyavskii-Shubert)",
+    )
+    
+    # Вывод результатов в консоль
+    print("\nРезультаты оптимизации:")
+    print(f"  Найденный x_min = {result['x_min']:.6f}")
+    print(f"  f(x_min) = {result['f_min']:.6f}")
+    print(f"  Итераций = {result['iterations']}")
+    print(f"  Время = {result['time']:.4f} с")
+    print(f"  Оценка L = {result['L']:.6g}")
+    print(f"  Отчёт сохранён: {args.output}")
+
+
 def run_demo(args: argparse.Namespace) -> None:
-    expression = "x**2 - 10*cos(2*pi*x) + 10"
+    """Демонстрационный запуск на функции Растригина."""
+    expression = "10 + x**2 - 10*cos(2*pi*x)"
     left, right = -5.12, 5.12
 
-    f_scalar, f_vector = build_function(expression)
-    result = strongin_global_search(
+    f_scalar = make_function_from_string(expression)
+    f_vector = make_vectorized_function(f_scalar)
+    
+    result = piyavskii_shubert(
         f_scalar,
-        (left, right),
+        left,
+        right,
         eps=args.eps,
-        r=args.r,
+        L=args.L,
         max_iter=args.max_iter,
+        initial_points=args.initial_points,
+        verbose=args.verbose,
     )
+    
     render_report(
+        f_scalar,
         f_vector,
         result,
         (left, right),
@@ -239,10 +370,28 @@ def run_demo(args: argparse.Namespace) -> None:
         Path(args.output),
         title="Демонстрация: функция Растригина (1D)",
     )
+    
+    print("\nРезультаты оптимизации (демонстрация):")
+    print(f"  Функция: {expression}")
+    print(f"  Интервал: [{left}, {right}]")
+    print(f"  Найденный x_min = {result['x_min']:.6f}")
+    print(f"  f(x_min) = {result['f_min']:.6f}")
+    print(f"  Итераций = {result['iterations']}")
+    print(f"  Время = {result['time']:.4f} с")
+    print(f"  Оценка L = {result['L']:.6g}")
+    if result.get('lower_bound') is not None:
+        print(f"  Нижняя граница: {result['lower_bound']:.6g}")
+        print(f"  Верхняя граница: {result['upper_bound']:.6g}")
+    print(f"  Отчёт сохранён: {args.output}")
+
 
 def main(argv: Sequence[str] | None = None) -> None:
+    """Главная функция."""
     args = parse_arguments(argv)
-    run_demo(args)
+    if args.demo:
+        run_demo(args)
+    else:
+        run_custom(args)
 
 
 if __name__ == "__main__":
