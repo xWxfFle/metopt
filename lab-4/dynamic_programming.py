@@ -99,12 +99,12 @@ class InvestmentPortfolioOptimizer:
         self.step_size_cb2 = 200.0  # 800 / 4
         self.step_size_deposit = 100.0  # 400 / 4
         
-        # Минимальные ограничения (из CSV)
+        # Минимальные ограничения
         self.min_cb1 = 30.0
         self.min_cb2 = 150.0
         self.min_deposit = 100.0
         
-        # Комиссии брокеров (из CSV)
+        # Комиссии брокеров
         self.commission_cb1 = 0.04  # 4%
         self.commission_cb2 = 0.07  # 7%
         self.commission_deposit = 0.05  # 5%
